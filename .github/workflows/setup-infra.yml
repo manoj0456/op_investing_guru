@@ -1,0 +1,298 @@
+name: Setup Infrastructure
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AWS_REGION: us-east-2
+      DOMAIN: invest.oppertunitypool.com
+      S3_BUCKET: invest.oppertunitypool.com
+      HOSTED_ZONE_ID: Z09838413LNVBXEZJYMS
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Request ACM certificate in us-east-1
+        id: cert
+        run: |
+          CERT_ARN=$(aws acm list-certificates --region us-east-1 \
+            --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" \
+            --output text 2>/dev/null)
+
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            CERT_ARN=$(aws acm request-certificate \
+              --domain-name "$DOMAIN" \
+              --validation-method DNS \
+              --region us-east-1 \
+              --query 'CertificateArn' --output text)
+            echo "Requested new certificate: $CERT_ARN"
+            sleep 15
+          else
+            echo "Certificate already exists: $CERT_ARN"
+          fi
+          echo "arn=$CERT_ARN" >> $GITHUB_OUTPUT
+
+      - name: Add DNS validation record to Route53
+        run: |
+          for i in 1 2 3 4 5; do
+            DNS_NAME=$(aws acm describe-certificate \
+              --certificate-arn "${{ steps.cert.outputs.arn }}" \
+              --region us-east-1 \
+              --query 'Certificate.DomainValidationOptions[0].ResourceRecord.Name' \
+              --output text 2>/dev/null)
+            if [ -n "$DNS_NAME" ] && [ "$DNS_NAME" != "None" ] && [ "$DNS_NAME" != "null" ]; then
+              break
+            fi
+            echo "Waiting for DNS validation record... ($i/5)"
+            sleep 15
+          done
+
+          DNS_VALUE=$(aws acm describe-certificate \
+            --certificate-arn "${{ steps.cert.outputs.arn }}" \
+            --region us-east-1 \
+            --query 'Certificate.DomainValidationOptions[0].ResourceRecord.Value' \
+            --output text)
+
+          echo "Adding DNS validation: $DNS_NAME -> $DNS_VALUE"
+
+          cat > /tmp/dns-change.json << EOF
+          {
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$DNS_NAME",
+                "Type": "CNAME",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "$DNS_VALUE"}]
+              }
+            }]
+          }
+          EOF
+
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "$HOSTED_ZONE_ID" \
+            --change-batch file:///tmp/dns-change.json
+          echo "DNS validation record added to Route53"
+
+      - name: Wait for ACM certificate validation
+        run: |
+          echo "Waiting for certificate to be issued (DNS propagation may take a few minutes)..."
+          aws acm wait certificate-validated \
+            --certificate-arn "${{ steps.cert.outputs.arn }}" \
+            --region us-east-1
+          echo "Certificate ISSUED!"
+
+      - name: Create S3 bucket
+        run: |
+          if aws s3api head-bucket --bucket "$S3_BUCKET" --region "$AWS_REGION" 2>/dev/null; then
+            echo "Bucket already exists: $S3_BUCKET"
+          else
+            aws s3api create-bucket \
+              --bucket "$S3_BUCKET" \
+              --region "$AWS_REGION" \
+              --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            echo "Bucket created: $S3_BUCKET"
+          fi
+
+          aws s3api put-public-access-block \
+            --bucket "$S3_BUCKET" \
+            --public-access-block-configuration \
+              "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+          echo "Public access blocked on $S3_BUCKET"
+
+      - name: Create CloudFront OAC
+        id: oac
+        run: |
+          OAC_NAME="invest-oppertunitypool-oac"
+
+          OAC_ID=$(aws cloudfront list-origin-access-controls \
+            --query "OriginAccessControlList.Items[?Name=='$OAC_NAME'].Id" \
+            --output text 2>/dev/null)
+
+          if [ -z "$OAC_ID" ] || [ "$OAC_ID" = "None" ]; then
+            cat > /tmp/oac-config.json << 'EOFJ'
+            {
+              "Name": "invest-oppertunitypool-oac",
+              "Description": "OAC for invest.oppertunitypool.com",
+              "SigningProtocol": "sigv4",
+              "SigningBehavior": "always",
+              "OriginAccessControlOriginType": "s3"
+            }
+            EOFJ
+
+            OAC_ID=$(aws cloudfront create-origin-access-control \
+              --origin-access-control-config file:///tmp/oac-config.json \
+              --query 'OriginAccessControl.Id' --output text)
+            echo "Created OAC: $OAC_ID"
+          else
+            echo "OAC already exists: $OAC_ID"
+          fi
+          echo "id=$OAC_ID" >> $GITHUB_OUTPUT
+
+      - name: Create CloudFront distribution
+        id: cloudfront
+        run: |
+          DIST_ID=$(aws cloudfront list-distributions --output json 2>/dev/null | \
+            jq -r '.DistributionList.Items[]? | select(.Aliases.Items[]? == "invest.oppertunitypool.com") | .Id' | head -1)
+
+          if [ -z "$DIST_ID" ] || [ "$DIST_ID" = "None" ]; then
+            OAC_ID="${{ steps.oac.outputs.id }}"
+            CERT_ARN="${{ steps.cert.outputs.arn }}"
+            CALLER_REF="invest-$(date +%s)"
+
+            cat > /tmp/dist-config.json << EOF
+            {
+              "CallerReference": "$CALLER_REF",
+              "Comment": "invest.oppertunitypool.com distribution",
+              "DefaultRootObject": "index.html",
+              "Aliases": {
+                "Quantity": 1,
+                "Items": ["invest.oppertunitypool.com"]
+              },
+              "Origins": {
+                "Quantity": 1,
+                "Items": [{
+                  "Id": "S3-invest.oppertunitypool.com",
+                  "DomainName": "invest.oppertunitypool.com.s3.us-east-2.amazonaws.com",
+                  "S3OriginConfig": {"OriginAccessIdentity": ""},
+                  "OriginAccessControlId": "$OAC_ID"
+                }]
+              },
+              "DefaultCacheBehavior": {
+                "TargetOriginId": "S3-invest.oppertunitypool.com",
+                "ViewerProtocolPolicy": "redirect-to-https",
+                "AllowedMethods": {
+                  "Quantity": 2,
+                  "Items": ["GET", "HEAD"],
+                  "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]}
+                },
+                "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+                "Compress": true
+              },
+              "CustomErrorResponses": {
+                "Quantity": 2,
+                "Items": [
+                  {
+                    "ErrorCode": 403,
+                    "ResponsePagePath": "/index.html",
+                    "ResponseCode": "200",
+                    "ErrorCachingMinTTL": 0
+                  },
+                  {
+                    "ErrorCode": 404,
+                    "ResponsePagePath": "/index.html",
+                    "ResponseCode": "200",
+                    "ErrorCachingMinTTL": 0
+                  }
+                ]
+              },
+              "PriceClass": "PriceClass_100",
+              "Enabled": true,
+              "HttpVersion": "http2",
+              "IsIPV6Enabled": true,
+              "ViewerCertificate": {
+                "ACMCertificateArn": "$CERT_ARN",
+                "SSLSupportMethod": "sni-only",
+                "MinimumProtocolVersion": "TLSv1.2_2021",
+                "CertificateSource": "acm"
+              }
+            }
+            EOF
+
+            DIST_OUT=$(aws cloudfront create-distribution \
+              --distribution-config file:///tmp/dist-config.json)
+            DIST_ID=$(echo "$DIST_OUT" | jq -r '.Distribution.Id')
+            DIST_DOMAIN=$(echo "$DIST_OUT" | jq -r '.Distribution.DomainName')
+            echo "Created CloudFront distribution: $DIST_ID"
+            echo "CloudFront domain: $DIST_DOMAIN"
+          else
+            DIST_DOMAIN=$(aws cloudfront get-distribution \
+              --id "$DIST_ID" \
+              --query 'Distribution.DomainName' --output text)
+            echo "Distribution already exists: $DIST_ID ($DIST_DOMAIN)"
+          fi
+
+          echo "id=$DIST_ID" >> $GITHUB_OUTPUT
+          echo "domain=$DIST_DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Update S3 bucket policy for CloudFront OAC
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          DIST_ID="${{ steps.cloudfront.outputs.id }}"
+
+          cat > /tmp/bucket-policy.json << EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Sid": "AllowCloudFrontServicePrincipal",
+              "Effect": "Allow",
+              "Principal": {"Service": "cloudfront.amazonaws.com"},
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::$S3_BUCKET/*",
+              "Condition": {
+                "StringEquals": {
+                  "AWS:SourceArn": "arn:aws:cloudfront::$ACCOUNT_ID:distribution/$DIST_ID"
+                }
+              }
+            }]
+          }
+          EOF
+
+          aws s3api put-bucket-policy \
+            --bucket "$S3_BUCKET" \
+            --policy file:///tmp/bucket-policy.json
+          echo "S3 bucket policy updated for CloudFront OAC"
+
+      - name: Create Route53 A record (alias to CloudFront)
+        run: |
+          DIST_DOMAIN="${{ steps.cloudfront.outputs.domain }}"
+
+          cat > /tmp/r53-change.json << EOF
+          {
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$DOMAIN",
+                "Type": "A",
+                "AliasTarget": {
+                  "HostedZoneId": "Z2FDTNDATAQYW2",
+                  "DNSName": "$DIST_DOMAIN",
+                  "EvaluateTargetHealth": false
+                }
+              }
+            }]
+          }
+          EOF
+
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "$HOSTED_ZONE_ID" \
+            --change-batch file:///tmp/r53-change.json
+          echo "Route53 A record: $DOMAIN -> $DIST_DOMAIN"
+
+      - name: Wait for CloudFront distribution to deploy
+        run: |
+          echo "Waiting for CloudFront distribution to finish deploying (10-20 min)..."
+          aws cloudfront wait distribution-deployed \
+            --id "${{ steps.cloudfront.outputs.id }}"
+          echo "CloudFront distribution is DEPLOYED!"
+
+      - name: Set INVEST_CLOUDFRONT_DISTRIBUTION_ID GitHub secret
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          DIST_ID="${{ steps.cloudfront.outputs.id }}"
+          gh secret set INVEST_CLOUDFRONT_DISTRIBUTION_ID \
+            --repo manoj0456/op_investing_guru \
+            --body "$DIST_ID"
+          echo "Secret INVEST_CLOUDFRONT_DISTRIBUTION_ID set to: $DIST_ID"
