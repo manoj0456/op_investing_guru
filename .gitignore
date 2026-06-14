@@ -11,8 +11,9 @@ build/
 venv/
 env/
 
-# SQLite database (contains live data — do not commit)
-backend/stocks.db
+# Lambda deployment artifact
+lambda.zip
+lambda/node_modules/
 
 # Node / frontend
 node_modules/
